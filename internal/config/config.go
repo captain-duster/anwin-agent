@@ -13,6 +13,8 @@ import (
 	"runtime"
 )
 
+const AgentServerURL = "https://www.anwin.ai"
+
 type Config struct {
 	ServerURL string `json:"server_url"`
 	Token     string `json:"token"`
@@ -86,6 +88,7 @@ func decrypt(ciphertext, key []byte) ([]byte, error) {
 }
 
 func Save(cfg *Config) error {
+	cfg.ServerURL = AgentServerURL
 	path, err := configFilePath()
 	if err != nil {
 		return err
@@ -127,6 +130,7 @@ func Load() (*Config, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil, errors.New("config is corrupt — run setup again")
 	}
+	cfg.ServerURL = AgentServerURL
 	return &cfg, nil
 }
 
