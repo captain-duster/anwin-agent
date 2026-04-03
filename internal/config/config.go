@@ -5,139 +5,143 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
-const AgentServerURL = "https://www.anwin.ai"
-
-type Config struct {
-	ServerURL string `json:"server_url"`
+type AgentConfig struct {
+	ServerURL string `json:"serverUrl"`
 	Token     string `json:"token"`
-	ProjectID string `json:"project_id"`
-	WatchPath string `json:"watch_path"`
-	Version   string `json:"version"`
+	WatchPath string `json:"watchPath"`
 }
 
-func configFilePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	dir := filepath.Join(home, ".anwin")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "agent.enc"), nil
+func configDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".anwin")
 }
 
-func deriveMachineKey() []byte {
-	hostname, _ := os.Hostname()
-	var identity string
-	switch runtime.GOOS {
-	case "windows":
-		identity = hostname + os.Getenv("USERNAME") + os.Getenv("COMPUTERNAME") + os.Getenv("USERPROFILE")
-	case "darwin":
-		identity = hostname + os.Getenv("USER") + os.Getenv("HOME") + "darwin"
-	default:
-		identity = hostname + os.Getenv("USER") + os.Getenv("HOME") + "linux"
-	}
-	hash := sha256.Sum256([]byte("anwin-agent-v1-salt::" + identity))
-	return hash[:]
+func configPath() string {
+	return filepath.Join(configDir(), "agent.enc")
 }
 
-func encrypt(plaintext, key []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
+func Save(cfg *AgentConfig) error {
+	if err := os.MkdirAll(configDir(), 0700); err != nil {
+		return fmt.Errorf("cannot create config directory: %w", err)
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, err
-	}
-	return gcm.Seal(nonce, nonce, plaintext, nil), nil
-}
 
-func decrypt(ciphertext, key []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
+	data, err := json.Marshal(cfg)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("cannot serialize config: %w", err)
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-	nonceSize := gcm.NonceSize()
-	if len(ciphertext) < nonceSize {
-		return nil, errors.New("corrupted config")
-	}
-	nonce, data := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	plain, err := gcm.Open(nil, nonce, data, nil)
-	if err != nil {
-		return nil, errors.New("decryption failed — run setup again")
-	}
-	return plain, nil
-}
 
-func Save(cfg *Config) error {
-	cfg.ServerURL = AgentServerURL
-	path, err := configFilePath()
+	encrypted, err := encrypt(data, deriveKey())
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot encrypt config: %w", err)
 	}
-	raw, err := json.Marshal(cfg)
-	if err != nil {
-		return err
+
+	if err := os.WriteFile(configPath(), []byte(hex.EncodeToString(encrypted)), 0600); err != nil {
+		return fmt.Errorf("cannot write config: %w", err)
 	}
-	encrypted, err := encrypt(raw, deriveMachineKey())
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(path, encrypted, 0600); err != nil {
-		return err
-	}
-	if runtime.GOOS != "windows" {
-		_ = os.Chmod(path, 0600)
-	}
+
 	return nil
 }
 
-func Load() (*Config, error) {
-	path, err := configFilePath()
+func Load() (*AgentConfig, error) {
+	raw, err := os.ReadFile(configPath())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("config not found: %w", err)
 	}
-	encrypted, err := os.ReadFile(path)
+
+	ciphertext, err := hex.DecodeString(strings.TrimSpace(string(raw)))
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, errors.New("not configured")
-		}
-		return nil, err
+		return nil, fmt.Errorf("corrupted config: %w", err)
 	}
-	raw, err := decrypt(encrypted, deriveMachineKey())
+
+	plaintext, err := decrypt(ciphertext, deriveKey())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot decrypt config: %w", err)
 	}
-	var cfg Config
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return nil, errors.New("config is corrupt — run setup again")
+
+	var cfg AgentConfig
+	if err := json.Unmarshal(plaintext, &cfg); err != nil {
+		return nil, fmt.Errorf("corrupted config data: %w", err)
 	}
-	cfg.ServerURL = AgentServerURL
+
 	return &cfg, nil
 }
 
 func Delete() error {
-	path, err := configFilePath()
-	if err != nil {
-		return err
+	return os.Remove(configPath())
+}
+
+func MachineFingerprint() string {
+	hostname, _ := os.Hostname()
+	username := os.Getenv("USER")
+	if username == "" {
+		username = os.Getenv("USERNAME")
 	}
-	return os.Remove(path)
+	hash := sha256.Sum256([]byte(hostname + "|" + username))
+	return hex.EncodeToString(hash[:])
+}
+
+func DetectPlatform() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "MAC"
+	case "windows":
+		return "WINDOWS"
+	default:
+		return "LINUX"
+	}
+}
+
+func deriveKey() []byte {
+	fingerprint := MachineFingerprint()
+	hash := sha256.Sum256([]byte("anwin-agent-key-v2|" + fingerprint))
+	return hash[:]
+}
+
+func encrypt(plaintext []byte, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce := make([]byte, aesGCM.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+
+	return aesGCM.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+func decrypt(ciphertext []byte, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := aesGCM.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	return aesGCM.Open(nil, nonce, ciphertext, nil)
 }

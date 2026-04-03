@@ -1,105 +1,91 @@
 package watcher
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/anwin/agent/internal/client"
-	"github.com/anwin/agent/internal/logger"
-	"github.com/anwin/agent/internal/scanner"
+	"github.com/captain-duster/anwin-agent/internal/client"
+	"github.com/captain-duster/anwin-agent/internal/scanner"
 	"github.com/fsnotify/fsnotify"
 )
 
-const (
-	debounceDelay = 2 * time.Second
-	heartbeatEvery = 60 * time.Second
-)
+const debounceDelay = 2 * time.Second
+const maxFileSizeBytes = 2 * 1024 * 1024
+const maxBatchSize = 200
 
 type Watcher struct {
-	watchPath   string
-	projectID   string
-	client      *client.Client
+	root        string
+	anwinClient *client.AnwinClient
 	pending     map[string]client.FileEntry
-	fileHashes  map[string]string
 	mu          sync.Mutex
 	timer       *time.Timer
-	done        chan struct{}
+	hashes      map[string]string
 }
 
-func New(watchPath, projectID string, c *client.Client) *Watcher {
+func New(root string, anwinClient *client.AnwinClient) *Watcher {
 	return &Watcher{
-		watchPath:  watchPath,
-		projectID:  projectID,
-		client:     c,
-		pending:    make(map[string]client.FileEntry),
-		fileHashes: make(map[string]string),
-		done:       make(chan struct{}),
+		root:        root,
+		anwinClient: anwinClient,
+		pending:     make(map[string]client.FileEntry),
+		hashes:      make(map[string]string),
 	}
 }
 
-func (w *Watcher) Stop() {
-	close(w.done)
-}
-
-func (w *Watcher) Start() error {
+func (w *Watcher) Start() {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
-		return fmt.Errorf("failed to initialize file watcher: %w", err)
+		fmt.Printf("  [%s] ✗ Cannot start file watcher: %s\n", ts(), err.Error())
+		return
 	}
 	defer fsw.Close()
 
-	if err := w.registerDirs(fsw, w.watchPath); err != nil {
-		return fmt.Errorf("failed to register directories: %w", err)
+	if err := w.registerDirs(fsw); err != nil {
+		fmt.Printf("  [%s] ✗ Cannot register directories: %s\n", ts(), err.Error())
+		return
 	}
 
-	heartbeat := time.NewTicker(heartbeatEvery)
-	defer heartbeat.Stop()
+	fmt.Printf("  [%s] Watching for changes...\n", ts())
 
 	for {
 		select {
-		case <-w.done:
-			logger.Info("Watcher stopping, flushing pending changes")
-			w.flushNow()
-			return nil
-
 		case event, ok := <-fsw.Events:
 			if !ok {
-				return nil
+				return
 			}
-			w.handleEvent(fsw, event)
+			w.handleEvent(event, fsw)
 
 		case err, ok := <-fsw.Errors:
 			if !ok {
-				return nil
+				return
 			}
-			logger.Warn("Watcher error", "error", err.Error())
-
-		case <-heartbeat.C:
-			if !w.client.Ping() {
-				logger.Warn("Heartbeat failed — server unreachable, will retry on next change")
-			}
+			fmt.Printf("  [%s] Watcher error: %s\n", ts(), err.Error())
 		}
 	}
 }
 
-func (w *Watcher) handleEvent(fsw *fsnotify.Watcher, event fsnotify.Event) {
-	info, statErr := os.Stat(event.Name)
+func (w *Watcher) handleEvent(event fsnotify.Event, fsw *fsnotify.Watcher) {
+	path := event.Name
+
+	info, statErr := os.Stat(path)
 
 	if statErr == nil && info.IsDir() {
-		if event.Op&fsnotify.Create != 0 && !scanner.IsIgnoredDir(event.Name) {
-			_ = w.registerDirs(fsw, event.Name)
+		if event.Has(fsnotify.Create) && !scanner.IsIgnoredDir(info.Name()) {
+			_ = fsw.Add(path)
+			w.scanNewDir(path)
 		}
 		return
 	}
 
-	if !scanner.IsSupportedFile(event.Name) {
+	if !scanner.IsSupportedFile(path, w.root) {
 		return
 	}
 
-	relPath, err := filepath.Rel(w.watchPath, event.Name)
+	relPath, err := filepath.Rel(w.root, path)
 	if err != nil {
 		return
 	}
@@ -108,48 +94,99 @@ func (w *Watcher) handleEvent(fsw *fsnotify.Watcher, event fsnotify.Event) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-		logger.Info("File removed", "file", relPath)
-		delete(w.fileHashes, event.Name)
-		w.pending[event.Name] = client.FileEntry{
+	if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
+		w.pending[relPath] = client.FileEntry{
 			RelativePath: relPath,
+			Content:      "",
+			Hash:         "",
 			Deleted:      true,
 		}
+		delete(w.hashes, relPath)
+		fmt.Printf("  [%s] ✗ %s\n", ts(), relPath)
 		w.scheduleSend()
 		return
 	}
 
-	if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-		content, err := os.ReadFile(event.Name)
+	if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
+		if statErr != nil {
+			return
+		}
+
+		if info.Size() > maxFileSizeBytes || info.Size() == 0 {
+			return
+		}
+
+		data, err := os.ReadFile(path)
 		if err != nil {
 			return
 		}
 
-		if info != nil && info.Size() > 1024*1024 {
+		hash := hashBytes(data)
+
+		if oldHash, exists := w.hashes[relPath]; exists && oldHash == hash {
 			return
 		}
 
-		hash := scanner.HashBytes(content)
-		if w.fileHashes[event.Name] == hash {
-			return
-		}
+		w.hashes[relPath] = hash
 
-		eventName := "modified"
-		if event.Op&fsnotify.Create != 0 {
-			eventName = "created"
-		}
-
-		logger.Info("Change detected", "file", relPath, "event", eventName)
-
-		w.fileHashes[event.Name] = hash
-		w.pending[event.Name] = client.FileEntry{
+		w.pending[relPath] = client.FileEntry{
 			RelativePath: relPath,
-			Content:      string(content),
+			Content:      string(data),
 			Hash:         hash,
 			Deleted:      false,
 		}
+
+		fmt.Printf("  [%s] ✦ %s\n", ts(), relPath)
 		w.scheduleSend()
 	}
+}
+
+func (w *Watcher) scanNewDir(dirPath string) {
+	_ = filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if scanner.IsIgnoredDir(info.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !scanner.IsSupportedFile(path, w.root) {
+			return nil
+		}
+		if info.Size() > maxFileSizeBytes || info.Size() == 0 {
+			return nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(w.root, path)
+		if err != nil {
+			return nil
+		}
+		relPath = filepath.ToSlash(relPath)
+		hash := hashBytes(data)
+
+		w.mu.Lock()
+		w.hashes[relPath] = hash
+		w.pending[relPath] = client.FileEntry{
+			RelativePath: relPath,
+			Content:      string(data),
+			Hash:         hash,
+			Deleted:      false,
+		}
+		w.mu.Unlock()
+
+		return nil
+	})
+
+	w.mu.Lock()
+	w.scheduleSend()
+	w.mu.Unlock()
 }
 
 func (w *Watcher) scheduleSend() {
@@ -165,6 +202,7 @@ func (w *Watcher) flush() {
 		w.mu.Unlock()
 		return
 	}
+
 	files := make([]client.FileEntry, 0, len(w.pending))
 	for _, f := range w.pending {
 		files = append(files, f)
@@ -172,43 +210,40 @@ func (w *Watcher) flush() {
 	w.pending = make(map[string]client.FileEntry)
 	w.mu.Unlock()
 
-	start := time.Now()
-	logger.Info("Syncing changes", "files", len(files))
+	batches := client.SplitBatches(files, maxBatchSize)
+	totalFiles := len(files)
 
-	if err := w.client.SyncFiles(w.projectID, files, false); err != nil {
-		logger.Error("Sync failed", "error", err.Error())
-	} else {
-		logger.Info("Sync complete", "files", len(files), "duration", fmt.Sprintf("%.2fs", time.Since(start).Seconds()))
+	fmt.Printf("  [%s] Syncing %d file(s)...\n", ts(), totalFiles)
+
+	for i, batch := range batches {
+		if err := w.anwinClient.SyncWithRetry(batch, false, 3); err != nil {
+			fmt.Printf("  [%s] ✗ Sync failed (batch %d/%d): %s\n", ts(), i+1, len(batches), err.Error())
+		}
 	}
+
+	fmt.Printf("  [%s] Sync complete.\n", ts())
 }
 
-func (w *Watcher) flushNow() {
-	w.mu.Lock()
-	if len(w.pending) == 0 {
-		w.mu.Unlock()
-		return
-	}
-	files := make([]client.FileEntry, 0, len(w.pending))
-	for _, f := range w.pending {
-		files = append(files, f)
-	}
-	w.pending = make(map[string]client.FileEntry)
-	w.mu.Unlock()
-
-	_ = w.client.SyncFiles(w.projectID, files, false)
-}
-
-func (w *Watcher) registerDirs(fsw *fsnotify.Watcher, root string) error {
-	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+func (w *Watcher) registerDirs(fsw *fsnotify.Watcher) error {
+	return filepath.Walk(w.root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
 		if info.IsDir() {
-			if scanner.IsIgnoredDir(path) {
+			if scanner.IsIgnoredDir(info.Name()) {
 				return filepath.SkipDir
 			}
 			return fsw.Add(path)
 		}
 		return nil
 	})
+}
+
+func hashBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func ts() string {
+	return time.Now().Format("15:04:05")
 }

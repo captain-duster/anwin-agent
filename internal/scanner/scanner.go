@@ -7,169 +7,191 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/anwin/agent/internal/client"
+	"github.com/captain-duster/anwin-agent/internal/client"
 )
 
-const (
-	maxFileSizeBytes = 1024 * 1024
-	batchSize        = 50
-)
-
-var ignoredDirs = map[string]bool{
-	"node_modules": true,
-	".git":         true,
-	"target":       true,
-	"build":        true,
-	"dist":         true,
-	".idea":        true,
-	".vscode":      true,
-	"__pycache__":  true,
-	".gradle":      true,
-	".mvn":         true,
-	"vendor":       true,
-	"coverage":     true,
-	".nyc_output":  true,
-	".next":        true,
-	".nuxt":        true,
-	"out":          true,
-	".cache":       true,
-	"tmp":          true,
-	"temp":         true,
-	"logs":         true,
-}
+const maxFileSizeBytes = 2 * 1024 * 1024
 
 var supportedExtensions = map[string]bool{
-	".java":        true,
-	".ts":          true,
-	".tsx":         true,
-	".js":          true,
-	".jsx":         true,
-	".py":          true,
-	".go":          true,
-	".rs":          true,
-	".kt":          true,
-	".kts":         true,
-	".xml":         true,
-	".yml":         true,
-	".yaml":        true,
-	".json":        true,
-	".sql":         true,
-	".properties":  true,
+	".java": true, ".kt": true, ".kts": true, ".scala": true, ".sc": true, ".groovy": true, ".gvy": true, ".gradle": true,
+	".py": true, ".pyw": true,
+	".js": true, ".mjs": true, ".cjs": true, ".jsx": true,
+	".ts": true, ".tsx": true,
+	".go": true,
+	".rb": true, ".rake": true, ".gemspec": true,
+	".php": true,
+	".cs": true, ".csx": true,
+	".cpp": true, ".cc": true, ".cxx": true, ".c": true, ".h": true, ".hpp": true, ".hxx": true,
+	".rs": true,
+	".swift": true,
+	".dart": true,
+	".sql": true,
+	".sh": true, ".bash": true, ".zsh": true, ".ps1": true,
+	".r": true,
+	".html": true, ".htm": true, ".css": true, ".scss": true, ".sass": true, ".less": true,
+	".graphql": true, ".gql": true,
+	".sol": true,
+	".lua": true, ".pl": true, ".pm": true, ".hs": true, ".ex": true, ".exs": true, ".erl": true, ".hrl": true,
+	".yaml": true, ".yml": true, ".json": true, ".toml": true, ".xml": true, ".properties": true, ".env": true,
+	".tf": true, ".tfvars": true,
+	".jsp": true, ".vue": true, ".svelte": true,
+	".md": true, ".txt": true, ".csv": true,
+}
+
+var ignoredDirs = map[string]bool{
+	".git":         true,
+	".svn":         true,
+	".hg":          true,
+	"node_modules": true,
+	"vendor":       true,
+	"build":        true,
+	"dist":         true,
+	"out":          true,
+	"__pycache__":  true,
+	".idea":        true,
+	".vscode":      true,
+	"target":       true,
+	"bin":          true,
+	"obj":          true,
+	".next":        true,
+	".nuxt":        true,
+	"coverage":     true,
+	".terraform":   true,
 	".gradle":      true,
-	".tf":          true,
-	".cs":          true,
-	".cpp":         true,
-	".c":           true,
-	".h":           true,
-	".rb":          true,
-	".php":         true,
-	".swift":       true,
-	".scala":       true,
-	".md":          true,
-	".toml":        true,
-	".env.example": true,
-	".sh":          true,
-	".dockerfile":  true,
+	".cache":       true,
+	".tox":         true,
+	"venv":         true,
+	".venv":        true,
+	"env":          true,
+	".env":         true,
+	".DS_Store":    true,
+	"Pods":         true,
+	".dart_tool":   true,
+	".pub-cache":   true,
 }
 
-type ScanResult struct {
-	Batches  [][]client.FileEntry
-	Total    int
-	Skipped  int
+var ignoredFiles = map[string]bool{
+	".DS_Store":      true,
+	"Thumbs.db":      true,
+	".gitignore":     true,
+	".gitattributes": true,
+	"package-lock.json": true,
+	"yarn.lock":      true,
+	"pnpm-lock.yaml": true,
+	"go.sum":         true,
+	"Cargo.lock":     true,
+	"Gemfile.lock":   true,
+	"composer.lock":  true,
+	"poetry.lock":    true,
 }
 
-func ScanDirectory(rootPath string) (*ScanResult, error) {
-	result := &ScanResult{}
-	var currentBatch []client.FileEntry
+func ScanDirectory(root string) []client.FileEntry {
+	var files []client.FileEntry
 
-	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
 
 		if info.IsDir() {
-			if IsIgnoredDir(path) {
+			if isIgnoredDir(info.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		if !IsSupportedFile(path) {
-			result.Skipped++
+		if !isSupportedFile(path, root) {
 			return nil
 		}
 
 		if info.Size() > maxFileSizeBytes {
-			result.Skipped++
 			return nil
 		}
 
-		content, err := os.ReadFile(path)
-		if err != nil {
-			result.Skipped++
+		if info.Size() == 0 {
 			return nil
 		}
 
-		relPath, err := filepath.Rel(rootPath, path)
+		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil
 		}
 
-		entry := client.FileEntry{
-			RelativePath: filepath.ToSlash(relPath),
-			Content:      string(content),
-			Hash:         HashBytes(content),
+		if isBinary(data) {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		hash := sha256Hex(data)
+
+		files = append(files, client.FileEntry{
+			RelativePath: relPath,
+			Content:      string(data),
+			Hash:         hash,
 			Deleted:      false,
-		}
-
-		currentBatch = append(currentBatch, entry)
-		result.Total++
-
-		if len(currentBatch) >= batchSize {
-			result.Batches = append(result.Batches, currentBatch)
-			currentBatch = nil
-		}
+		})
 
 		return nil
 	})
 
-	if err != nil {
-		return nil, err
-	}
-
-	if len(currentBatch) > 0 {
-		result.Batches = append(result.Batches, currentBatch)
-	}
-
-	return result, nil
+	return files
 }
 
-func IsIgnoredDir(path string) bool {
+func IsSupportedFile(path string, root string) bool {
+	return isSupportedFile(path, root)
+}
+
+func IsIgnoredDir(name string) bool {
+	return isIgnoredDir(name)
+}
+
+func isSupportedFile(path string, root string) bool {
 	base := filepath.Base(path)
-	return ignoredDirs[base] || strings.HasPrefix(base, ".")
-}
 
-func IsSupportedFile(path string) bool {
-	name := strings.ToLower(filepath.Base(path))
-	ext := strings.ToLower(filepath.Ext(path))
-
-	if name == "dockerfile" || name == "makefile" || name == "jenkinsfile" {
-		return true
-	}
-	if !supportedExtensions[ext] {
+	if ignoredFiles[base] {
 		return false
 	}
 
-	parts := strings.Split(filepath.ToSlash(path), "/")
-	for _, part := range parts {
-		if ignoredDirs[part] {
-			return false
-		}
+	if strings.HasPrefix(base, ".") && base != ".env" {
+		return false
 	}
-	return true
+
+	ext := strings.ToLower(filepath.Ext(path))
+
+	if base == "Dockerfile" || base == "Makefile" || base == "Rakefile" || base == "Vagrantfile" || base == "Jenkinsfile" || base == "Procfile" {
+		return true
+	}
+
+	return supportedExtensions[ext]
 }
 
-func HashBytes(data []byte) string {
+func isIgnoredDir(name string) bool {
+	return ignoredDirs[name]
+}
+
+func isBinary(data []byte) bool {
+	check := 512
+	if len(data) < check {
+		check = len(data)
+	}
+	for i := 0; i < check; i++ {
+		if data[i] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func HashFile(data []byte) string {
+	return sha256Hex(data)
+}
+
+func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }

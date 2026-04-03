@@ -1,4 +1,4 @@
-module github.com/anwin/agent
+module github.com/captain-duster/anwin-agent
 
 go 1.21
 
