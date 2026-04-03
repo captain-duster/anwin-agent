@@ -10,11 +10,11 @@ $BinaryName = "anwin-agent.exe"
 Write-Host ""
 Write-Host "  +==========================================+" -ForegroundColor Cyan
 Write-Host "  |                                          |" -ForegroundColor Cyan
-Write-Host "  |        XXXXX  N   N W   W  I  N   N     |" -ForegroundColor Cyan
-Write-Host "  |        A   A  NN  N W   W  I  NN  N     |" -ForegroundColor Cyan
-Write-Host "  |        AAAAA  N N N W W W  I  N N N     |" -ForegroundColor Cyan
-Write-Host "  |        A   A  N  NN  W W   I  N  NN     |" -ForegroundColor Cyan
-Write-Host "  |        A   A  N   N   W W  I  N   N     |" -ForegroundColor Cyan
+Write-Host "  |                            _             |" -ForegroundColor Cyan
+Write-Host "  |   __ _  _ __  __      __  (_) _ __       |" -ForegroundColor Cyan
+Write-Host "  |  / _' | '_ \ \ \ /\ / /  | || '_ \     |" -ForegroundColor Cyan
+Write-Host "  | | (_| | | | | \ V  V /   | || | | |     |" -ForegroundColor Cyan
+Write-Host "  |  \__,_|_| |_|  \_/\_/    |_||_| |_|     |" -ForegroundColor Cyan
 Write-Host "  |                                          |" -ForegroundColor Cyan
 Write-Host "  |         Local Code Sync Agent            |" -ForegroundColor Cyan
 Write-Host "  |             Version $Version               |" -ForegroundColor Cyan
